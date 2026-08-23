@@ -1,0 +1,30 @@
+[2026-05-05 01:22:01,519::evaluate::INFO] mol_stable:	0.3434
+[2026-05-05 01:22:01,521::evaluate::INFO] atm_stable:	0.9133
+[2026-05-05 01:22:01,524::evaluate::INFO] recon_success:	0.9965
+[2026-05-05 01:22:01,526::evaluate::INFO] eval_success:	0.9455
+[2026-05-05 01:22:01,527::evaluate::INFO] complete:	0.9460
+[2026-05-05 01:22:01,528::evaluate::INFO] JS bond distances of complete mols: 
+[2026-05-05 01:22:01,528::evaluate::INFO] JSD_6-6|4:	0.0967
+[2026-05-05 01:22:01,529::evaluate::INFO] JSD_6-6|1:	0.4629
+[2026-05-05 01:22:01,530::evaluate::INFO] JSD_6-8|1:	0.3335
+[2026-05-05 01:22:01,531::evaluate::INFO] JSD_6-7|1:	0.2554
+[2026-05-05 01:22:01,531::evaluate::INFO] JSD_6-8|2:	0.1869
+[2026-05-05 01:22:01,534::evaluate::INFO] JSD_6-6|2:	0.2512
+[2026-05-05 01:22:01,535::evaluate::INFO] JSD_6-7|4:	0.1652
+[2026-05-05 01:22:01,537::evaluate::INFO] JSD_6-7|2:	0.1972
+[2026-05-05 01:22:01,540::evaluate::INFO] JSD_CC_2A:	0.2660
+[2026-05-05 01:22:01,543::evaluate::INFO] JSD_All_12A:	0.0631
+[2026-05-05 01:22:01,546::evaluate::INFO] Atom type JS: 0.12147262272317647
+[2026-05-05 01:22:01,548::evaluate::INFO] Number of reconstructed mols: 9965, complete mols: 9460, evaluated mols: 9455
+[2026-05-05 01:22:01,555::evaluate::INFO] QED:   Mean: 0.613 Median: 0.631
+[2026-05-05 01:22:01,565::evaluate::INFO] SA:    Mean: 0.725 Median: 0.720
+[2026-05-05 01:22:01,575::evaluate::INFO] Diversity (RDK fp): Mean pairwise Tanimoto 0.2916 | Diversity mean: 0.7084 | Diversity median: 0.6965
+[2026-05-05 01:22:01,605::evaluate::INFO] Vina Score:  Mean: -7.370 Median: -7.729
+[2026-05-05 01:22:01,609::evaluate::INFO] Vina Min  :  Mean: -8.003 Median: -8.000
+[2026-05-05 01:22:01,617::evaluate::INFO] ring size: 3 ratio: 0.000
+[2026-05-05 01:22:01,625::evaluate::INFO] ring size: 4 ratio: 0.008
+[2026-05-05 01:22:01,640::evaluate::INFO] ring size: 5 ratio: 0.334
+[2026-05-05 01:22:01,651::evaluate::INFO] ring size: 6 ratio: 0.988
+[2026-05-05 01:22:01,658::evaluate::INFO] ring size: 7 ratio: 0.251
+[2026-05-05 01:22:01,669::evaluate::INFO] ring size: 8 ratio: 0.038
+[2026-05-05 01:22:01,672::evaluate::INFO] ring size: 9 ratio: 0.013

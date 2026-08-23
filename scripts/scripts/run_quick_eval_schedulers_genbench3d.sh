@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# SCHEDULERS=("log_uniform" "arcsin" "edm" "edm1")
+# SCHEDULERS=("log_uniform" "arcsin" "edm1")
+# SCHEDULERS=("log_uniform" "edm1")
+            # --cfg_strategy "ramp_up" \
+            # CFG_SCALES=(0 0.5 1.0 2.0 3.0 5.0)
+SCHEDULERS=("gen_arcsin")
+CFG_SCALES=(0 0.5 1.0 2.0 3.0 5.0 10.0 15.0 20.0)
+for SCHED in "${SCHEDULERS[@]}"
+do
+    for CFG in "${CFG_SCALES[@]}"
+    do
+        echo "=========================================================="
+        echo "Running quick_evaluate: time_scheduler=$SCHED cfg_scale=$CFG"
+        echo "=========================================================="
+        python scripts/quick_evaluate.py \
+            --config logs_diffusion/training_cfg_muon_2026_04_29__16_22_09/sampling.yml \
+            --checkpoint logs_diffusion/training_cfg_muon_2026_04_29__16_22_09/checkpoints/366000.pt \
+            --num_proteins 100 \
+            --num_ligands_per_protein 10 \
+            --docking_mode vina_score \
+            --export_grouped_sdf \
+            --run_genbench \
+            --gb3d_dir ${WORKSPACE_ROOT}/genbench3d \
+            --genbench_python /home/${USER}/anaconda3/envs/genbench3d/bin/python \
+            --genbench_do_conf_analysis \
+            --genbench_no_vina \
+            --time_scheduler "$SCHED" \
+            --cfg_scale "$CFG"
+        echo "Done: time_scheduler=$SCHED cfg_scale=$CFG"
+        echo ""
+    done
+done
