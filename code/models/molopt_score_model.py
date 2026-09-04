@@ -9,7 +9,14 @@ from tqdm.auto import tqdm
 
 from models.common import compose_context, ShiftedSoftplus
 from models.egnn import EGNN
-from models.uni_transformer import UniTransformerO2TwoUpdateGeneral
+from models.uni_transformer import UniTransformerO2TwoUpdateGeneral, safe_vector_norm
+from models.sct_loss import (
+    categorical_logit_sct_loss,
+    coordinate_sct_residual,
+    graph_coordinate_rms_normalize,
+    sct_warmup_factor,
+    sct_time_scale,
+)
 from datasets.protein_ligand import KMAP
 from utils.misc import DFMTimeScheduler
 
@@ -103,7 +110,7 @@ def cosine_beta_schedule(timesteps, s=0.008):
 
 
 def get_distance(pos, edge_index):
-    return (pos[edge_index[0]] - pos[edge_index[1]]).norm(dim=-1)
+    return safe_vector_norm(pos[edge_index[0]] - pos[edge_index[1]], dim=-1)
 
 
 def to_torch_const(x):
@@ -270,6 +277,103 @@ class ScorePosNet3D(nn.Module):
         self.bond_loss = getattr(config, 'bond_loss', False)
         self.loss_bond_weight = getattr(config, 'loss_bond_weight', 1.0)
         self.loss_non_bond_weight = getattr(config, 'loss_non_bond_weight', 0.1)
+
+        # Single-time consistency training (sCT).  All of these options are
+        # intentionally configuration-only attributes: enabling sCT must not
+        # add parameters to old checkpoints.  ``sct_loss_weight`` was the
+        # original coordinate-only name; keep it as a read-only legacy alias
+        # while making the scope explicit in the canonical name.
+        self.use_sct_coordinate_consistency = bool(
+            getattr(config, 'use_sct_coordinate_consistency', False)
+        )
+        sct_coord_loss_weight = getattr(config, 'sct_coord_loss_weight', None)
+        legacy_sct_loss_weight = getattr(config, 'sct_loss_weight', None)
+        if sct_coord_loss_weight is None:
+            sct_coord_loss_weight = (
+                1.0 if legacy_sct_loss_weight is None else legacy_sct_loss_weight
+            )
+        elif (
+            legacy_sct_loss_weight is not None
+            and sct_coord_loss_weight != legacy_sct_loss_weight
+        ):
+            raise ValueError(
+                'sct_coord_loss_weight conflicts with legacy sct_loss_weight'
+            )
+        self.sct_coord_loss_weight = sct_coord_loss_weight
+        self.sct_coord_probe_step = getattr(config, 'sct_coord_probe_step', 0.1)
+        self.sct_time_parameterization = getattr(
+            config, 'sct_time_parameterization', 'linear'
+        )
+        self.sct_tangent_norm_mode = getattr(
+            config, 'sct_tangent_norm_mode', 'fixed-c'
+        )
+        self.sct_tangent_norm_constant = getattr(config, 'sct_tangent_norm_constant', 0.1)
+        self.sct_tangent_warmup_steps = getattr(config, 'sct_tangent_warmup_steps', 2000)
+        self.discrete_consistency_mode = getattr(config, 'discrete_consistency_mode', 'none')
+        self.sct_discrete_probe_step = getattr(config, 'sct_discrete_probe_step', 0.1)
+        self.sct_discrete_tangent_norm_constant = getattr(
+            config, 'sct_discrete_tangent_norm_constant', 0.1
+        )
+        self.sct_discrete_tangent_warmup_steps = getattr(
+            config, 'sct_discrete_tangent_warmup_steps', 2000
+        )
+        sct_atom_loss_weight = getattr(config, 'sct_atom_loss_weight', None)
+        sct_bond_loss_weight = getattr(config, 'sct_bond_loss_weight', None)
+        self.sct_atom_loss_weight = (
+            self.loss_v_weight if sct_atom_loss_weight is None else sct_atom_loss_weight
+        )
+        self.sct_bond_loss_weight = (
+            self.loss_bond_weight if sct_bond_loss_weight is None else sct_bond_loss_weight
+        )
+
+        for _name, _value in (
+            ('sct_coord_loss_weight', self.sct_coord_loss_weight),
+            ('sct_coord_probe_step', self.sct_coord_probe_step),
+            ('sct_tangent_norm_constant', self.sct_tangent_norm_constant),
+            ('sct_tangent_warmup_steps', self.sct_tangent_warmup_steps),
+            ('sct_discrete_probe_step', self.sct_discrete_probe_step),
+            ('sct_discrete_tangent_norm_constant', self.sct_discrete_tangent_norm_constant),
+            ('sct_discrete_tangent_warmup_steps', self.sct_discrete_tangent_warmup_steps),
+            ('sct_atom_loss_weight', self.sct_atom_loss_weight),
+            ('sct_bond_loss_weight', self.sct_bond_loss_weight),
+        ):
+            if not isinstance(_value, (int, float)) or not math.isfinite(float(_value)):
+                raise ValueError(f'{_name} must be finite')
+        if self.sct_coord_loss_weight < 0:
+            raise ValueError('sct_coord_loss_weight must be >= 0')
+        if self.sct_coord_probe_step <= 0:
+            raise ValueError('sct_coord_probe_step must be > 0')
+        if self.sct_time_parameterization not in ('linear', 'log'):
+            raise ValueError(
+                "sct_time_parameterization must be 'linear' or 'log', "
+                f"got {self.sct_time_parameterization!r}"
+            )
+        if self.sct_tangent_norm_mode not in ('fixed-c', 'scale-c', 'no-norm'):
+            raise ValueError(
+                "sct_tangent_norm_mode must be 'fixed-c', 'scale-c' or "
+                "'no-norm', "
+                f"got {self.sct_tangent_norm_mode!r}"
+            )
+        if self.sct_tangent_norm_constant <= 0:
+            raise ValueError('sct_tangent_norm_constant must be > 0')
+        if self.sct_tangent_warmup_steps < 0:
+            raise ValueError('sct_tangent_warmup_steps must be >= 0')
+        if self.discrete_consistency_mode not in ('none', 'logit_sct'):
+            raise ValueError(
+                "discrete_consistency_mode must be 'none' or 'logit_sct', "
+                f"got {self.discrete_consistency_mode!r}"
+            )
+        if self.sct_discrete_probe_step <= 0:
+            raise ValueError('sct_discrete_probe_step must be > 0')
+        if self.sct_discrete_tangent_norm_constant <= 0:
+            raise ValueError('sct_discrete_tangent_norm_constant must be > 0')
+        if self.sct_discrete_tangent_warmup_steps < 0:
+            raise ValueError('sct_discrete_tangent_warmup_steps must be >= 0')
+        if self.sct_atom_loss_weight < 0:
+            raise ValueError('sct_atom_loss_weight must be >= 0')
+        if self.sct_bond_loss_weight < 0:
+            raise ValueError('sct_bond_loss_weight must be >= 0')
+
         # Certainty loss hyperparams
         self.use_certainty_loss = getattr(config, 'use_certainty_loss', False)
         self.certainty_loss_weight = getattr(config, 'certainty_loss_weight', 0.1)
@@ -671,7 +775,8 @@ class ScorePosNet3D(nn.Module):
                 sigma=None, return_all=False, fix_x=False, guide=None,
                 init_ligand_bond_index=None, init_ligand_bond_type=None,
                 vina_bin=None, qed_bin=None, sa_bin=None, condition_force_drop=False,
-                condition_apply_training_dropout=True):
+                condition_apply_training_dropout=True, edge_indices=None,
+                return_edge_indices=False):
         """_summary_
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -783,15 +888,19 @@ class ScorePosNet3D(nn.Module):
 
         if guide is None:
             sig = inspect.signature(self.refine_net.forward)
+            refine_kwargs = {
+                'return_all': return_all,
+                'fix_x': fix_x,
+            }
+            if 'bond_edge_index' in sig.parameters:
+                refine_kwargs['bond_edge_index'] = global_bond_edge_index
             if 'bond_edge_feat' in sig.parameters:
-                outputs = self.refine_net(
-                    h_all, pos_all, mask_ligand, batch_all,
-                    return_all=return_all, fix_x=fix_x,
-                    bond_edge_index=global_bond_edge_index,
-                    bond_edge_feat=bond_edge_feat
-                )
-            else:
-                outputs = self.refine_net(h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x)
+                refine_kwargs['bond_edge_feat'] = bond_edge_feat
+            if 'edge_indices' in sig.parameters:
+                refine_kwargs['edge_indices'] = edge_indices
+            if 'return_edge_indices' in sig.parameters:
+                refine_kwargs['return_edge_indices'] = return_edge_indices
+            outputs = self.refine_net(h_all, pos_all, mask_ligand, batch_all, **refine_kwargs)
         else:
             sig_g = inspect.signature(self.refine_net.forward_guided)
             if 'bond_edge_feat' in sig_g.parameters:
@@ -826,6 +935,8 @@ class ScorePosNet3D(nn.Module):
             'final_h': final_h,
             'final_ligand_h': final_ligand_h
         }
+        if 'edge_indices' in outputs:
+            preds['edge_indices'] = outputs['edge_indices']
         # Bond logits: computed per-graph to handle variable ligand sizes in batch
         if self.bond_loss:
             num_graphs = batch_ligand.max().item() + 1
@@ -837,7 +948,9 @@ class ScorePosNet3D(nn.Module):
                 N_g = h_g.shape[0]
                 hi = h_g.unsqueeze(1).expand(-1, N_g, -1)   # (N_g, N_g, H)
                 hj = h_g.unsqueeze(0).expand(N_g, -1, -1)   # (N_g, N_g, H)
-                dij = (pos_g.unsqueeze(1) - pos_g.unsqueeze(0)).norm(dim=-1, keepdim=True)  # (N_g, N_g, 1)
+                dij = safe_vector_norm(
+                    pos_g.unsqueeze(1) - pos_g.unsqueeze(0), dim=-1, keepdim=True
+                )  # (N_g, N_g, 1)
                 bond_feat = torch.cat([hi, hj, dij], dim=-1)  # (N_g, N_g, 2H+1)
                 pred_bond_logits_list.append(self.bond_inference(bond_feat))  # (N_g, N_g, 5)
             preds['pred_bond_logits'] = pred_bond_logits_list
@@ -850,6 +963,266 @@ class ScorePosNet3D(nn.Module):
                 'layer_pred_ligand_v': final_all_ligand_v
             })
         return preds
+
+    def _compute_sct_joint_target(
+        self,
+        *,
+        protein_pos_noisy,
+        protein_v,
+        batch_protein,
+        ligand_pos_perturbed,
+        ligand_pos_velocity,
+        ligand_v_perturbed,
+        batch_ligand,
+        sigma_per_atom,
+        noisy_bond_index,
+        noisy_bond_type,
+        vina_bin,
+        qed_bin,
+        sa_bin,
+        include_bond,
+        edge_indices=None,
+    ):
+        """Compute the live teacher and joint path/time JVP.
+
+        The categorical state, protein pocket and condition bins are closed
+        over as constants.  Only ligand coordinates and sigma are tangent
+        inputs, so this evaluates ``J_x f @ epsilon + partial_sigma f`` on the
+        exact noisy state used by the student forward.
+        """
+
+        if not hasattr(torch, 'func') or not hasattr(torch.func, 'jvp'):
+            raise RuntimeError('sCT requires torch.func.jvp')
+
+        ligand_pos_velocity = ligand_pos_velocity.detach()
+        # ``q`` is shared by coordinate, atom and bond outputs.  In log mode
+        # this is the log-sigma chain rule, including the numerical floor
+        # required by the training sigma range.
+        time_scale = sct_time_scale(
+            sigma_per_atom,
+            sigma_min=self.sigma_min,
+            time_parameterization=self.sct_time_parameterization,
+        )
+        coordinate_direction = time_scale * ligand_pos_velocity
+        sigma_direction = time_scale
+
+        def teacher_fn(path_ligand_pos, path_sigma):
+            path_preds = self(
+                protein_pos=protein_pos_noisy,
+                protein_v=protein_v,
+                batch_protein=batch_protein,
+                init_ligand_pos=path_ligand_pos,
+                init_ligand_v=ligand_v_perturbed,
+                batch_ligand=batch_ligand,
+                sigma=path_sigma,
+                init_ligand_bond_index=noisy_bond_index,
+                init_ligand_bond_type=noisy_bond_type,
+                vina_bin=vina_bin,
+                qed_bin=qed_bin,
+                sa_bin=sa_bin,
+                condition_apply_training_dropout=False,
+                edge_indices=edge_indices,
+                return_edge_indices=False,
+            )
+            outputs = (path_preds['pred_ligand_pos'], path_preds['pred_ligand_v'])
+            if include_bond:
+                if 'pred_bond_logits' not in path_preds:
+                    raise RuntimeError('Bond sCT requested but bond logits are unavailable')
+                bond_logits_flat = torch.cat(
+                    [graph_logits.reshape(-1, 5) for graph_logits in path_preds['pred_bond_logits']],
+                    dim=0,
+                )
+                outputs = outputs + (bond_logits_flat,)
+            return outputs
+
+        # Forward-mode AD remains available under no_grad.  This prevents a
+        # reverse-mode graph through the live teacher while retaining the JVP.
+        with torch.no_grad():
+            teacher_outputs, tangent_outputs = torch.func.jvp(
+                teacher_fn,
+                (ligand_pos_perturbed, sigma_per_atom),
+                (coordinate_direction, sigma_direction),
+                strict=False,
+            )
+
+        teacher_outputs = tuple(output.detach() for output in teacher_outputs)
+        tangent_outputs = tuple(output.detach() for output in tangent_outputs)
+        return teacher_outputs, tangent_outputs
+
+    def _compute_sct_loss(
+        self,
+        *,
+        preds,
+        teacher_outputs,
+        tangent_outputs,
+        pos_noise,
+        sigma_per_atom,
+        batch_ligand,
+        batch_bond,
+        step,
+        include_bond=False,
+    ):
+        """Compute all enabled single-time sCT terms from an existing student."""
+
+        pred_pos = preds['pred_ligand_pos']
+        device, dtype = pred_pos.device, pred_pos.dtype
+        zero = pred_pos.sum() * 0.0
+
+        # Keep a stable scalar result schema so disabled branches are easy to
+        # log and do not require any special handling in the training loop.
+        losses = {
+            'loss_sct': zero,
+            'loss_sct_pos': zero,
+            'loss_sct_pos_weighted': zero,
+            'sct_pos_probe_step': zero,
+            'sct_pos_tangent_rms': zero,
+            'sct_pos_warmup': zero,
+            'loss_sct_atom': zero,
+            'loss_sct_atom_weighted': zero,
+            'sct_atom_tangent_rms': zero,
+            'sct_atom_normalized_tangent_rms': zero,
+            'sct_atom_virtual_kl': zero,
+            'sct_atom_teacher_entropy': zero,
+            'sct_atom_target_entropy': zero,
+            'sct_atom_argmax_flip': zero,
+            'loss_sct_bond': zero,
+            'loss_sct_bond_weighted': zero,
+            'sct_bond_tangent_rms': zero,
+            'sct_bond_normalized_tangent_rms': zero,
+            'sct_bond_virtual_kl': zero,
+            'sct_bond_teacher_entropy': zero,
+            'sct_bond_target_entropy': zero,
+            'sct_bond_argmax_flip': zero,
+        }
+
+        # Only scale-c uses the time-dependent additive floor.  fixed-c keeps
+        # the historical constant floor, while no-norm skips RMS/floor
+        # normalization altogether.  The same mode is shared by coordinate,
+        # atom and bond leaves.
+        norm_constant_scale = None
+        if self.sct_tangent_norm_mode == 'scale-c':
+            norm_constant_scale = sct_time_scale(
+                sigma_per_atom,
+                sigma_min=self.sigma_min,
+                time_parameterization=self.sct_time_parameterization,
+            )
+
+        if self.use_sct_coordinate_consistency:
+            pos_warmup = torch.tensor(
+                sct_warmup_factor(step, self.sct_tangent_warmup_steps),
+                device=device,
+                dtype=dtype,
+            )
+            normalized_tangent, tangent_rms = graph_coordinate_rms_normalize(
+                tangent_outputs[0],
+                batch_ligand,
+                self.sct_tangent_norm_constant,
+                norm_constant_scale=norm_constant_scale,
+                norm_mode=self.sct_tangent_norm_mode,
+            )
+            residual = coordinate_sct_residual(
+                pred_pos,
+                teacher_outputs[0],
+                normalized_tangent,
+                pos_warmup,
+                self.sct_coord_probe_step,
+            )
+            pos_atom_loss = residual.square().sum(dim=-1)
+            pos_graph_loss = scatter_mean(pos_atom_loss, batch_ligand, dim=0)
+            loss_sct_pos = pos_graph_loss.mean()
+            losses.update({
+                'loss_sct_pos': loss_sct_pos,
+                'loss_sct_pos_weighted': (
+                    self.sct_coord_loss_weight
+                    * self.loss_pos_weight
+                    * loss_sct_pos
+                    / self.sct_coord_probe_step
+                ),
+                'sct_pos_probe_step': pred_pos.new_tensor(self.sct_coord_probe_step),
+                'sct_pos_tangent_rms': tangent_rms.mean().detach(),
+                'sct_pos_warmup': pos_warmup.detach(),
+            })
+
+        if self.discrete_consistency_mode == 'logit_sct':
+            discrete_warmup = torch.tensor(
+                sct_warmup_factor(step, self.sct_discrete_tangent_warmup_steps),
+                device=device,
+                dtype=dtype,
+            )
+            atom_result = categorical_logit_sct_loss(
+                preds['pred_ligand_v'],
+                teacher_outputs[1],
+                tangent_outputs[1],
+                batch_ligand,
+                self.sct_discrete_probe_step,
+                self.sct_discrete_tangent_norm_constant,
+                discrete_warmup,
+                norm_constant_scale=norm_constant_scale,
+                norm_mode=self.sct_tangent_norm_mode,
+            )
+            losses.update({
+                'loss_sct_atom': atom_result['loss'],
+                'loss_sct_atom_weighted': self.sct_atom_loss_weight * atom_result['loss'],
+                'sct_atom_tangent_rms': atom_result['raw_tangent_rms'].mean().detach(),
+                'sct_atom_normalized_tangent_rms': atom_result[
+                    'normalized_tangent_rms'
+                ].mean().detach(),
+                'sct_atom_virtual_kl': atom_result['virtual_teacher_kl'].mean().detach(),
+                'sct_atom_teacher_entropy': atom_result['teacher_entropy'].mean().detach(),
+                'sct_atom_target_entropy': atom_result['target_entropy'].mean().detach(),
+                'sct_atom_argmax_flip': atom_result['argmax_flip'].mean().detach(),
+            })
+
+            if (
+                include_bond
+                and batch_bond is not None
+                and 'pred_bond_logits' in preds
+                and len(preds['pred_bond_logits']) > 0
+            ):
+                student_bond_logits = torch.cat(
+                    [graph_logits.reshape(-1, 5) for graph_logits in preds['pred_bond_logits']],
+                    dim=0,
+                )
+                bond_result = categorical_logit_sct_loss(
+                    student_bond_logits,
+                    teacher_outputs[2],
+                    tangent_outputs[2],
+                    batch_bond,
+                    self.sct_discrete_probe_step,
+                    self.sct_discrete_tangent_norm_constant,
+                    discrete_warmup,
+                    norm_constant_scale=(
+                        None
+                        if norm_constant_scale is None
+                        else sct_time_scale(
+                            scatter_mean(
+                                sigma_per_atom.reshape(-1), batch_ligand, dim=0
+                            )[batch_bond],
+                            sigma_min=self.sigma_min,
+                            time_parameterization=self.sct_time_parameterization,
+                        )
+                    ),
+                    norm_mode=self.sct_tangent_norm_mode,
+                )
+                losses.update({
+                    'loss_sct_bond': bond_result['loss'],
+                    'loss_sct_bond_weighted': self.sct_bond_loss_weight * bond_result['loss'],
+                    'sct_bond_tangent_rms': bond_result['raw_tangent_rms'].mean().detach(),
+                    'sct_bond_normalized_tangent_rms': bond_result[
+                        'normalized_tangent_rms'
+                    ].mean().detach(),
+                    'sct_bond_virtual_kl': bond_result['virtual_teacher_kl'].mean().detach(),
+                    'sct_bond_teacher_entropy': bond_result['teacher_entropy'].mean().detach(),
+                    'sct_bond_target_entropy': bond_result['target_entropy'].mean().detach(),
+                    'sct_bond_argmax_flip': bond_result['argmax_flip'].mean().detach(),
+                })
+
+        losses['loss_sct'] = (
+            losses['loss_sct_pos_weighted']
+            + losses['loss_sct_atom_weighted']
+            + losses['loss_sct_bond_weighted']
+        )
+        return losses
 
     # atom type diffusion process
     def q_v_pred_one_timestep(self, log_vt_1, t, batch):
@@ -972,7 +1345,7 @@ class ScorePosNet3D(nn.Module):
             vina_bin=None, qed_bin=None, sa_bin=None,
             pocket_noise_mode='fixed', pos_noise_std=0.0,
             pocket_noise_sigma_coeff=0.0, pocket_noise_max=0.0,
-            perturb_condition_only=False
+            perturb_condition_only=False, global_step=0
     ):
         num_graphs = batch_protein.max().item() + 1
         protein_pos, ligand_pos, _ = center_pos_rescale(
@@ -1007,6 +1380,50 @@ class ScorePosNet3D(nn.Module):
 
             cond_vina_bin, cond_qed_bin, cond_sa_bin = vina_bin, qed_bin, sa_bin
             condition_apply_training_dropout = True
+            sct_enabled = (
+                self.use_sct_coordinate_consistency
+                or self.discrete_consistency_mode == 'logit_sct'
+            )
+            sct_condition_prepared = False
+            graph_has_condition = None
+
+            # SCT needs the exact same condition dropout realization in the
+            # student and JVP teacher.  Sample it once before either forward;
+            # the disabled path below intentionally retains the old behavior.
+            if self.use_condition and sct_enabled:
+                null_idx = self.condition_null_idx
+                if cond_vina_bin is None or cond_qed_bin is None or cond_sa_bin is None:
+                    cond_vina_bin = torch.full(
+                        (num_graphs,), null_idx, dtype=torch.long, device=device
+                    )
+                    cond_qed_bin = torch.full(
+                        (num_graphs,), null_idx, dtype=torch.long, device=device
+                    )
+                    cond_sa_bin = torch.full(
+                        (num_graphs,), null_idx, dtype=torch.long, device=device
+                    )
+                else:
+                    cond_vina_bin = cond_vina_bin.to(device).long().view(-1).clamp(
+                        min=0, max=self.condition_bins - 1
+                    )
+                    cond_qed_bin = cond_qed_bin.to(device).long().view(-1).clamp(
+                        min=0, max=self.condition_bins - 1
+                    )
+                    cond_sa_bin = cond_sa_bin.to(device).long().view(-1).clamp(
+                        min=0, max=self.condition_bins - 1
+                    )
+                cond_vina_bin, cond_qed_bin, cond_sa_bin, graph_has_condition = (
+                    self._apply_condition_dropout(
+                        cond_vina_bin,
+                        cond_qed_bin,
+                        cond_sa_bin,
+                        null_idx,
+                        device,
+                        force_drop=False,
+                    )
+                )
+                condition_apply_training_dropout = False
+                sct_condition_prepared = True
 
             # Optional pocket noise on protein coordinates (independent from ligand sigma noising).
             if pocket_noise_mode == 'fixed':
@@ -1026,17 +1443,37 @@ class ScorePosNet3D(nn.Module):
                 and pocket_noise_mode in ('sigma_scaled', 'sigma_sqrt_scaled')
             ):
                 null_idx = self.condition_null_idx
-                if cond_vina_bin is None or cond_qed_bin is None or cond_sa_bin is None:
-                    cond_vina_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
-                    cond_qed_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
-                    cond_sa_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
-                else:
-                    cond_vina_bin = cond_vina_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
-                    cond_qed_bin = cond_qed_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
-                    cond_sa_bin = cond_sa_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
-                cond_vina_bin, cond_qed_bin, cond_sa_bin, graph_has_condition = self._apply_condition_dropout(
-                    cond_vina_bin, cond_qed_bin, cond_sa_bin, null_idx, device, force_drop=False
-                )
+                if not sct_condition_prepared:
+                    if cond_vina_bin is None or cond_qed_bin is None or cond_sa_bin is None:
+                        cond_vina_bin = torch.full(
+                            (num_graphs,), null_idx, dtype=torch.long, device=device
+                        )
+                        cond_qed_bin = torch.full(
+                            (num_graphs,), null_idx, dtype=torch.long, device=device
+                        )
+                        cond_sa_bin = torch.full(
+                            (num_graphs,), null_idx, dtype=torch.long, device=device
+                        )
+                    else:
+                        cond_vina_bin = cond_vina_bin.to(device).long().view(-1).clamp(
+                            min=0, max=self.condition_bins - 1
+                        )
+                        cond_qed_bin = cond_qed_bin.to(device).long().view(-1).clamp(
+                            min=0, max=self.condition_bins - 1
+                        )
+                        cond_sa_bin = cond_sa_bin.to(device).long().view(-1).clamp(
+                            min=0, max=self.condition_bins - 1
+                        )
+                    cond_vina_bin, cond_qed_bin, cond_sa_bin, graph_has_condition = (
+                        self._apply_condition_dropout(
+                            cond_vina_bin,
+                            cond_qed_bin,
+                            cond_sa_bin,
+                            null_idx,
+                            device,
+                            force_drop=False,
+                        )
+                    )
                 pocket_noise_graph = pocket_noise_graph * graph_has_condition.float()
                 condition_apply_training_dropout = False
 
@@ -1052,6 +1489,7 @@ class ScorePosNet3D(nn.Module):
 
             # ── Bond DFM noising (for training feedback loop) ────────────────
             noisy_bond_index, noisy_bond_type = None, None
+            batch_bond = None
             if self.bond_loss and ligand_bond_index is not None:
                 from datasets.pl_data import get_batch_connectivity_matrix
                 # 1. Build GT flat bond state for all pairs (N^2)
@@ -1095,6 +1533,7 @@ class ScorePosNet3D(nn.Module):
                 qed_bin=cond_qed_bin,
                 sa_bin=cond_sa_bin,
                 condition_apply_training_dropout=condition_apply_training_dropout,
+                return_edge_indices=sct_enabled,
             )
             pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
@@ -1144,17 +1583,94 @@ class ScorePosNet3D(nn.Module):
                 loss_bond = torch.stack(bond_loss_per_graph).mean()
                 loss = loss + self.loss_bond_weight * loss_bond
 
+            loss_original = loss
+            if sct_enabled:
+                if 'edge_indices' not in preds:
+                    raise RuntimeError(
+                        'sCT requires the UniTransformer to return fixed edge indices '
+                        'for the JVP teacher'
+                    )
+                include_sct_bond = bool(
+                    self.discrete_consistency_mode == 'logit_sct'
+                    and self.bond_loss
+                    and batch_bond is not None
+                    and ligand_bond_index is not None
+                    and ligand_bond_type is not None
+                    and ligand_bond_type_batch is not None
+                )
+                teacher_outputs, tangent_outputs = self._compute_sct_joint_target(
+                    protein_pos_noisy=protein_pos_noisy,
+                    protein_v=protein_v,
+                    batch_protein=batch_protein,
+                    ligand_pos_perturbed=ligand_pos_perturbed,
+                    ligand_pos_velocity=pos_noise,
+                    ligand_v_perturbed=ligand_v_perturbed,
+                    batch_ligand=batch_ligand,
+                    sigma_per_atom=sigma_per_atom,
+                    noisy_bond_index=noisy_bond_index,
+                    noisy_bond_type=noisy_bond_type,
+                    vina_bin=cond_vina_bin,
+                    qed_bin=cond_qed_bin,
+                    sa_bin=cond_sa_bin,
+                    include_bond=include_sct_bond,
+                    edge_indices=preds['edge_indices'],
+                )
+                sct_losses = self._compute_sct_loss(
+                    preds=preds,
+                    teacher_outputs=teacher_outputs,
+                    tangent_outputs=tangent_outputs,
+                    pos_noise=pos_noise,
+                    sigma_per_atom=sigma_per_atom,
+                    batch_ligand=batch_ligand,
+                    batch_bond=batch_bond if include_sct_bond else None,
+                    step=global_step,
+                    include_bond=include_sct_bond,
+                )
+                loss = loss_original + sct_losses['loss_sct']
+            else:
+                # No JVP and no second forward when sCT is disabled.  Keep the
+                # scalar schema stable for the existing logging code.
+                sct_losses = {
+                    key: loss_original.new_zeros(())
+                    for key in (
+                        'loss_sct',
+                        'loss_sct_pos',
+                        'loss_sct_pos_weighted',
+                        'sct_pos_probe_step',
+                        'sct_pos_tangent_rms',
+                        'sct_pos_warmup',
+                        'loss_sct_atom',
+                        'loss_sct_atom_weighted',
+                        'sct_atom_tangent_rms',
+                        'sct_atom_normalized_tangent_rms',
+                        'sct_atom_virtual_kl',
+                        'sct_atom_teacher_entropy',
+                        'sct_atom_target_entropy',
+                        'sct_atom_argmax_flip',
+                        'loss_sct_bond',
+                        'loss_sct_bond_weighted',
+                        'sct_bond_tangent_rms',
+                        'sct_bond_normalized_tangent_rms',
+                        'sct_bond_virtual_kl',
+                        'sct_bond_teacher_entropy',
+                        'sct_bond_target_entropy',
+                        'sct_bond_argmax_flip',
+                    )
+                }
+
             return {
                 'loss_pos': loss_pos,
                 'loss_v': loss_v,
                 'loss_bond': loss_bond,
                 'loss_certainty_atomics': loss_certainty_atomics,
+                'loss_original': loss_original,
                 'loss': loss,
                 'x0': ligand_pos,
                 'pred_ligand_pos': pred_ligand_pos,
                 'pred_ligand_v': pred_ligand_v,
                 'pred_pos_noise': pred_ligand_pos,
-                'ligand_v_recon': F.softmax(pred_ligand_v, dim=-1)
+                'ligand_v_recon': F.softmax(pred_ligand_v, dim=-1),
+                **sct_losses,
             }
         elif self.diffusion_type == 'ddpm':
             raise NotImplementedError("DDPM is not yet implemented.")

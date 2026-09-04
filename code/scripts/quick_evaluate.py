@@ -36,7 +36,7 @@ def export_metrics_to_grouped_sdf(pt_file, out_dir, logger):
         logger.error("Metrics file not found (run evaluation with --save first): %s", pt_file)
         return False
     os.makedirs(out_dir, exist_ok=True)
-    data = torch.load(pt_file)
+    data = torch.load(pt_file, weights_only=False)
     results = data.get("all_results", [])
     grouped_mols = defaultdict(list)
     for i, res in enumerate(results):
@@ -395,7 +395,7 @@ def main():
         )
 
     # Load the score (generation) model checkpoint
-    ckpt = torch.load(args.checkpoint, map_location=args.device)
+    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     ckpt_cfg = ckpt['config']
 
     # Build transforms – keep ligand atom mode consistent with the checkpoint
@@ -508,7 +508,7 @@ def main():
     if guide_paths:
         logger.info(f'Loading {len(guide_paths)} guidance models...')
         for gp, w, cord, categ in zip(guide_paths, guide_weights, guide_cord, guide_categ):
-            guide_ckpt = torch.load(gp, map_location=args.device)
+            guide_ckpt = torch.load(gp, map_location=args.device, weights_only=False)
             guide_model = DockGuideNet3D(
                 guide_ckpt['config'].model,
                 protein_atom_feature_dim=protein_featurizer.feature_dim,
@@ -730,4 +730,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

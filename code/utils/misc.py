@@ -6,7 +6,41 @@ import time
 import numpy as np
 import torch
 import yaml
-from easydict import EasyDict
+try:
+    from easydict import EasyDict
+except ModuleNotFoundError:
+    class EasyDict(dict):
+        """Small attribute-accessible dict fallback for cluster environments."""
+
+        def __init__(self, mapping=None, **kwargs):
+            mapping = {} if mapping is None else dict(mapping)
+            mapping.update(kwargs)
+            super().__init__({key: self._convert(value) for key, value in mapping.items()})
+
+        @classmethod
+        def _convert(cls, value):
+            if isinstance(value, dict):
+                return cls(value)
+            if isinstance(value, list):
+                return [cls._convert(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(cls._convert(item) for item in value)
+            return value
+
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+        def __delattr__(self, name):
+            try:
+                del self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
 
 
 class BlackHole(object):

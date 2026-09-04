@@ -13,8 +13,6 @@ from collections import Counter, defaultdict
 from utils.evaluation import eval_atom_type, scoring_func, analyze, eval_bond_length
 from utils.evaluation.similarity import mean_pairwise_tanimoto
 from utils import misc, reconstruct, transforms
-from utils.evaluation.docking_qvina import QVinaDockingTask
-from utils.evaluation.docking_vina import VinaDockingTask
 
 
 def _docking_worker(payload, queue):
@@ -30,11 +28,13 @@ def _docking_worker(payload, queue):
         exhaustiveness = payload['exhaustiveness']
 
         if mode == 'qvina':
+            from utils.evaluation.docking_qvina import QVinaDockingTask
             vina_task = QVinaDockingTask.from_generated_mol(
                 mol, ligand_filename=ligand_filename, protein_root=protein_root, protein_filename=protein_filename
             )
             vina_results = vina_task.run_sync()
         elif mode in ['vina_score', 'vina_dock']:
+            from utils.evaluation.docking_vina import VinaDockingTask
             vina_task = VinaDockingTask.from_generated_mol(
                 mol, ligand_filename=ligand_filename, protein_root=protein_root, protein_filename=protein_filename
             )
@@ -125,7 +125,9 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
     all_pair_dist, all_bond_dist = [], []
     success_pair_dist, success_atom_types = [], Counter()
     for _, r_name in enumerate(tqdm(results_fn_list, desc='Eval')):
-        r = torch.load(r_name)
+        # Result files contain trusted ProteinLigandData objects; PyTorch
+        # 2.6+ otherwise defaults to weights_only=True and rejects them.
+        r = torch.load(r_name, weights_only=False)
         all_pred_ligand_pos = r['pred_ligand_pos_traj']
         all_pred_ligand_v = r['pred_ligand_v_traj']
         num_samples += len(all_pred_ligand_pos)
@@ -176,6 +178,7 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
                             protein_root=protein_root, protein_filename=protein_filename, exhaustiveness=exhaustiveness
                         )
                     else:
+                        from utils.evaluation.docking_qvina import QVinaDockingTask
                         vina_task = QVinaDockingTask.from_generated_mol(
                             mol, ligand_filename=ligand_filename, protein_root=protein_root,
                             protein_filename=protein_filename)
@@ -190,6 +193,7 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
                             protein_root=protein_root, protein_filename=protein_filename, exhaustiveness=exhaustiveness
                         )
                     else:
+                        from utils.evaluation.docking_vina import VinaDockingTask
                         vina_task = VinaDockingTask.from_generated_mol(
                             mol, ligand_filename=ligand_filename, protein_root=protein_root,
                             protein_filename=protein_filename)

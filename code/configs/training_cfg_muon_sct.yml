@@ -1,0 +1,139 @@
+# From-scratch VEDA + coordinate/atom/bond sCT training.
+# No checkpoint should be passed to train_diffusion.py for this experiment.
+
+data:
+  name: pl_dock_guide
+  path: /shared/healthinfolab/phz24002/AliDiff/data/crossdocked_v1.1_rmsd1.0_pocket10
+  split: /shared/healthinfolab/phz24002/AliDiff/data/crossdocked_pocket10_pose_split_dock_guide.pt
+  index_path: /shared/healthinfolab/phz24002/AliDiff/data/crossdocked_v1.1_rmsd1.0_pocket10/index.pkl
+  transform:
+    ligand_atom_mode: add_aromatic
+    random_rot: false
+    condition_bins_path: /shared/healthinfolab/phz24002/AliDiff/data/condition_bins.yml
+  test_path: /shared/healthinfolab/phz24002/TAGMol/data/test_set
+
+model:
+  diffusion_type: veda
+  model_mean_type: C0
+  beta_schedule: sigmoid
+
+  # Keep the established EDM/DFM parameterization, changing only the sCT and
+  # bond-training switches for this from-scratch experiment.
+  sigma_data: 10
+  sigma_min: 0.001
+  sigma_max: 800
+  rho: 2.0
+  edm_p_mean: -0.12
+  edm_p_std: 1.70
+
+  discrete_prior: uniform
+  dfm_beta: 2
+  dfm_type: campbell
+  mask_mode: uniform
+  beta_start: 1.e-7
+  beta_end: 2.e-3
+  v_beta_schedule: cosine
+  v_beta_s: 0.01
+  num_diffusion_timesteps: 100
+  loss_pos_weight: 3.0
+  loss_pos_divide_by_c_out_sq: true
+  loss_v_weight: 3.0
+
+  # Keep bond prediction disabled, matching the baseline configuration.
+  bond_loss: false
+  bond_input: false
+  use_bond_edge_feats: false
+  sample_bond: false
+  loss_bond_weight: 0.1
+  loss_non_bond_weight: 0.01
+
+  # Coordinate and atom sCT remain enabled. Bond sCT follows the baseline
+  # bond path and is inactive when bond_loss is false. In this codebase log-t
+  # means q = log(sigma).
+  use_sct_coordinate_consistency: true
+  sct_coord_loss_weight: 0.1
+  sct_coord_probe_step: 0.1
+  sct_time_parameterization: log
+  sct_tangent_norm_mode: fixed-c
+  sct_tangent_norm_constant: 0.1
+  sct_tangent_warmup_steps: 10000
+  discrete_consistency_mode: logit_sct
+  sct_discrete_probe_step: 0.1
+  sct_discrete_tangent_norm_constant: 0.1
+  sct_discrete_tangent_warmup_steps: 10000
+  sct_atom_loss_weight: 0.01
+
+  sample_time_method: symmetric
+  use_condition: true
+  condition_dropout: 0.5
+  condition_dropout_vina: 0.0
+  condition_dropout_qed: 0.0
+  condition_dropout_sa: 0.0
+  perturb_condition_only: false
+  condition_bins: 5
+  condition_emb_dim: 8
+
+  time_emb_dim: 64
+  time_emb_mode: sin
+  time_scheduler: log_uniform
+  center_pos_mode: protein
+  rescale_factor: 1.0
+  veda_x_pred_mode: constant
+
+  node_indicator: true
+  model_type: uni_o2
+  num_blocks: 1
+  num_layers: 9
+  hidden_dim: 128
+  n_heads: 16
+  edge_feat_dim: 4
+  num_r_gaussian: 20
+  knn: 32
+  num_node_types: 8
+  act_fn: relu
+  norm: true
+  cutoff_mode: knn
+  ew_net_type: global
+  num_x2h: 1
+  num_h2x: 1
+  r_max: 10.0
+  x2h_out_fc: false
+  sync_twoup: false
+
+train:
+  seed: 2021
+  batch_size: 4
+  num_workers: 4
+  n_acc_batch: 1
+  max_iters: 400000
+  val_freq: 2000
+  wandb_project: PocketVE-CM
+  quick_eval_freq: 10000
+  quick_eval_num_proteins: 10
+  quick_eval_num_ligands_per_protein: 10
+  # The JVP training environment has no Vina/Meeko; run full docking later.
+  quick_eval_docking_mode: none
+  pos_noise_std: 0.1
+  pocket_noise_mode: sigma_scaled
+  pocket_noise_sigma_coeff: 0.1
+  pocket_noise_max: 0.5
+  max_grad_norm: 8.0
+  optimizer:
+    type: muon
+    # Match the established baseline optimizer rates.
+    muon_lr: 0.001
+    muon_momentum: 0.95
+    muon_weight_decay: 0.0
+    ns_steps: 5
+    lr: 1.0e-4
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1.0e-8
+    weight_decay: 0.0
+    muon_exclude_keywords:
+      - embed
+  scheduler:
+    type: plateau
+    factor: 0.6
+    patience: 10
+    min_lr: 1.e-5

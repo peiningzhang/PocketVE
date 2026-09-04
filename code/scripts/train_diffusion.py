@@ -5,7 +5,12 @@ import tempfile
 
 import numpy as np
 import torch
-import torch.utils.tensorboard
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    # The GPU training environment provides tensorboardX but not the optional
+    # tensorboard package required by torch.utils.tensorboard.
+    from tensorboardX import SummaryWriter
 import wandb
 from sklearn.metrics import roc_auc_score
 from torch.nn.utils import clip_grad_norm_
@@ -21,6 +26,33 @@ from datasets.pl_data import FOLLOW_BATCH
 from models.molopt_score_model import ScorePosNet3D
 from scripts.sample_diffusion import sample_diffusion_ligand
 from scripts.evaluate_diffusion import run_evaluation
+
+
+def get_validation_time_steps(num_diffusion_timesteps, num_samples, seed):
+    """Return one reproducible, sorted set of validation diffusion steps.
+
+    A local NumPy generator keeps the validation schedule independent from the
+    training/data-loader random streams.  The returned schedule is intended to
+    be created once per process and reused by every validation call.
+    """
+
+    num_diffusion_timesteps = int(num_diffusion_timesteps)
+    num_samples = int(num_samples)
+    if num_diffusion_timesteps <= 0:
+        raise ValueError('num_diffusion_timesteps must be > 0')
+    if num_samples <= 0:
+        raise ValueError('num_samples must be > 0')
+    if seed is None:
+        raise ValueError('seed must be provided')
+
+    num_samples = min(num_samples, num_diffusion_timesteps)
+    if num_samples == num_diffusion_timesteps:
+        return np.arange(num_diffusion_timesteps, dtype=np.int64)
+
+    rng = np.random.RandomState(int(seed))
+    return np.sort(
+        rng.choice(num_diffusion_timesteps, size=num_samples, replace=False)
+    ).astype(np.int64)
 
 
 def get_auroc(y_true, y_pred, feat_mode):
@@ -118,17 +150,19 @@ if __name__ == '__main__':
         logger = misc.get_logger('train', log_dir)
         if args.reuse_logdir:
             logger.info(f'Reusing log directory: {log_dir}')
-        writer = torch.utils.tensorboard.SummaryWriter(log_dir)
+        writer = SummaryWriter(log_dir)
 
     # Initialize wandb (skip if --no_wandb or --trial)
     if use_wandb:
+        wandb_project = getattr(config.train, 'wandb_project', 'tagmol')
         wandb_init_kwargs = {
-            'project': "tagmol",
+            'project': wandb_project,
             'name': f"{config_name}_{args.tag}" if args.tag else config_name,
             'config': config,
             'dir': log_dir,
             'save_code': True
         }
+        logger.info(f'Wandb project: {wandb_project}')
         
         # Handle wandb resume logic
         if args.wandb_id:
@@ -261,6 +295,19 @@ if __name__ == '__main__':
             str(bool(getattr(config.model, 'perturb_condition_only', False))),
         )
 
+    num_val_timesteps = 5 if args.trial else 10
+    validation_seed = int(getattr(config.train, 'val_seed', config.train.seed))
+    validation_time_steps = get_validation_time_steps(
+        model.num_timesteps,
+        num_val_timesteps,
+        validation_seed,
+    )
+    logger.info(
+        'Validation time steps (seed=%d): %s',
+        validation_seed,
+        validation_time_steps.tolist(),
+    )
+
     # Optimizer and scheduler
     optimizer = utils_train.get_optimizer(config.train.optimizer, model)
     scheduler = utils_train.get_scheduler(config.train.scheduler, optimizer)
@@ -337,10 +384,16 @@ if __name__ == '__main__':
                 pocket_noise_sigma_coeff=float(getattr(config.train, 'pocket_noise_sigma_coeff', 0.0)),
                 pocket_noise_max=float(getattr(config.train, 'pocket_noise_max', 0.0)),
                 perturb_condition_only=bool(getattr(config.model, 'perturb_condition_only', False)),
+                global_step=it,
             )
             loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
             loss_bond = results.get('loss_bond', torch.tensor(0.))
             loss_certainty_atomics = results.get('loss_certainty_atomics', torch.tensor(0.))
+            loss_original = results.get('loss_original', loss)
+            loss_sct = results.get('loss_sct', torch.tensor(0., device=loss.device))
+            loss_sct_pos = results.get('loss_sct_pos', torch.tensor(0., device=loss.device))
+            loss_sct_atom = results.get('loss_sct_atom', torch.tensor(0., device=loss.device))
+            loss_sct_bond = results.get('loss_sct_bond', torch.tensor(0., device=loss.device))
             loss = loss / config.train.n_acc_batch
             loss.backward()
         orig_grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
@@ -348,8 +401,10 @@ if __name__ == '__main__':
 
         if it % args.train_report_iter == 0:
             logger.info(
-                '[Train] Iter %d | Loss %.6f (pos %.6f | v %.6f | bond %.6f | cert_atom %.6f) | Lr: %.6f | Grad Norm: %.6f' % (
-                    it, loss, loss_pos, loss_v, loss_bond, loss_certainty_atomics, optimizer.param_groups[0]['lr'], orig_grad_norm
+                '[Train] Iter %d | Loss %.6f (original %.6f | sCT %.6f [pos %.6f | atom %.6f | bond %.6f] | pos %.6f | v %.6f | bond %.6f | cert_atom %.6f) | Lr: %.6f | Grad Norm: %.6f' % (
+                    it, loss, loss_original, loss_sct, loss_sct_pos, loss_sct_atom,
+                    loss_sct_bond, loss_pos, loss_v, loss_bond, loss_certainty_atomics,
+                    optimizer.param_groups[0]['lr'], orig_grad_norm
                 )
             )
 
@@ -382,11 +437,9 @@ if __name__ == '__main__':
         # fix time steps
         sum_loss, sum_loss_pos, sum_loss_v, sum_n = 0, 0, 0, 0
         sum_loss_bond, sum_loss_non_bond = 0, 0
+        sct_scalar_sums = {}
         all_pred_v, all_true_v = [], []
         all_pred_bond_type, all_gt_bond_type = [], []
-
-        # Trial mode: use fewer timesteps for faster validation
-        num_val_timesteps = 5 if args.trial else 10
 
         with torch.no_grad():
             model.eval()
@@ -394,8 +447,10 @@ if __name__ == '__main__':
                 batch = batch.to(args.device)
                 batch_size = batch.num_graphs
                 t_loss, t_loss_pos, t_loss_v = [], [], []
-                for t in np.linspace(0, model.num_timesteps - 1, num_val_timesteps).astype(int):
-                    time_step = torch.tensor([t] * batch_size).to(args.device)
+                for t in validation_time_steps:
+                    time_step = torch.full(
+                        (batch_size,), int(t), dtype=torch.long, device=args.device
+                    )
                     results = model.get_diffusion_loss(
                         protein_pos=batch.protein_pos,
                         protein_v=batch.protein_atom_feature.float(),
@@ -416,6 +471,7 @@ if __name__ == '__main__':
                         pocket_noise_sigma_coeff=float(getattr(config.train, 'pocket_noise_sigma_coeff', 0.0)),
                         pocket_noise_max=float(getattr(config.train, 'pocket_noise_max', 0.0)),
                         perturb_condition_only=bool(getattr(config.model, 'perturb_condition_only', False)),
+                        global_step=it,
                     )
                     loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
                     loss_bond = results.get('loss_bond', torch.tensor(0.))
@@ -428,10 +484,24 @@ if __name__ == '__main__':
                     all_pred_v.append(results['ligand_v_recon'].detach().cpu().numpy())
                     all_true_v.append(batch.ligand_atom_feature_full.detach().cpu().numpy())
 
+                    # Aggregate every scalar sCT metric by graph count.  New
+                    # diagnostics can therefore be logged without changing
+                    # this validation loop or the scheduler input.
+                    for key, value in results.items():
+                        if (
+                            (key.startswith('loss_sct') or key.startswith('sct_'))
+                            and torch.is_tensor(value)
+                            and value.squeeze().ndim == 0
+                        ):
+                            sct_scalar_sums[key] = sct_scalar_sums.get(key, 0.0) + float(value) * batch_size
+
         avg_loss = sum_loss / sum_n
         avg_loss_pos = sum_loss_pos / sum_n
         avg_loss_v = sum_loss_v / sum_n
         avg_loss_bond = sum_loss_bond / sum_n
+        avg_sct_scalars = {
+            key: value / sum_n for key, value in sct_scalar_sums.items()
+        }
 
         if config.train.scheduler.type == 'plateau':
             scheduler.step(avg_loss)
@@ -444,8 +514,9 @@ if __name__ == '__main__':
         atom_auroc = get_auroc(np.concatenate(all_true_v), np.concatenate(all_pred_v, axis=0),
                                feat_mode=config.data.transform.ligand_atom_mode)
         logger.info(
-            '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3 | Loss bond %.6f | Avg atom auroc %.6f' % (
-                it, avg_loss, avg_loss_pos, avg_loss_v * 1000, avg_loss_bond, atom_auroc
+            '[Validate] Iter %05d | Loss %.6f (sCT %.6f) | Loss pos %.6f | Loss v %.6f e-3 | Loss bond %.6f | Avg atom auroc %.6f' % (
+                it, avg_loss, avg_sct_scalars.get('loss_sct', 0.0), avg_loss_pos,
+                avg_loss_v * 1000, avg_loss_bond, atom_auroc
             )
         )
 
@@ -453,6 +524,8 @@ if __name__ == '__main__':
             writer.add_scalar('val/loss', avg_loss, it)
             writer.add_scalar('val/loss_pos', avg_loss_pos, it)
             writer.add_scalar('val/loss_v', avg_loss_v, it)
+            for key, value in avg_sct_scalars.items():
+                writer.add_scalar(f'val/{key}', value, it)
             writer.flush()
 
         # Log to wandb (only if not in trial/no_wandb mode)
@@ -464,6 +537,7 @@ if __name__ == '__main__':
                 'val/loss_v': avg_loss_v,
                 'val/atom_auroc': atom_auroc,
             }
+            log_dict.update({f'val/{key}': value for key, value in avg_sct_scalars.items()})
             wandb.log(log_dict)
 
         return avg_loss
@@ -501,7 +575,7 @@ if __name__ == '__main__':
                 }, last_ckpt_path)
                 logger.info(f'[Checkpoint] Saved last checkpoint to: {last_ckpt_path} (iter {it})')
             # Quick eval: sample + full metrics every quick_eval_freq steps, log to wandb
-            if (it % quick_eval_freq == 0) or (it == config.train.max_iters):
+            if (not args.trial) and ((it % quick_eval_freq == 0) or (it == config.train.max_iters)):
                 eval_scales = [0.0, 3.0] if getattr(config.model, 'use_condition', False) else [0.0]
                 for cfg_scale in eval_scales:
                     tmp_dir = tempfile.mkdtemp(prefix=f'train_quick_eval_cfg{cfg_scale}_', dir=log_dir)

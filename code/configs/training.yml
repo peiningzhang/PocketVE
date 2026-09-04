@@ -46,6 +46,22 @@ model:
   sample_bond: false
   loss_bond_weight: 0.1
   loss_non_bond_weight: 0.01   # suppress no-bond class dominance
+
+  # Single-time consistency training (disabled by default)
+  use_sct_coordinate_consistency: false
+  sct_coord_loss_weight: 1.0
+  sct_coord_probe_step: 0.1
+  sct_time_parameterization: linear  # linear | log; log means log-sigma
+  sct_tangent_norm_mode: fixed-c     # fixed-c | scale-c | no-norm
+  sct_tangent_norm_constant: 0.1
+  sct_tangent_warmup_steps: 2000
+  discrete_consistency_mode: none  # none | logit_sct
+  sct_discrete_probe_step: 0.1
+  sct_discrete_tangent_norm_constant: 0.1
+  sct_discrete_tangent_warmup_steps: 2000
+  sct_atom_loss_weight: null       # null => inherit loss_v_weight
+  sct_bond_loss_weight: null       # null => inherit loss_bond_weight
+
   sample_time_method: symmetric  # ['importance', 'symmetric']
   # use_condition: true           # Optional: enable condition conditioning
   # condition_dropout: 0.2         # Optional: each of vina/qed/sa dropped independently during training

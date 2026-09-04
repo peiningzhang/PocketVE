@@ -2,7 +2,7 @@ import os
 import subprocess
 import random
 import string
-from easydict import EasyDict
+from utils.misc import EasyDict
 from rdkit import Chem
 from rdkit.Chem.rdForceFieldHelpers import UFFOptimizeMolecule
 

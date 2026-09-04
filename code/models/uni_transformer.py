@@ -3,9 +3,93 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import radius_graph, knn_graph
-from torch_scatter import scatter_softmax, scatter_sum
+from torch_scatter import scatter_softmax as torch_scatter_softmax
+from torch_scatter import scatter_sum as torch_scatter_sum
 
 from models.common import GaussianSmearing, MLP, batch_hybrid_edge_connection, outer_product
+
+
+def safe_vector_norm(x, dim=-1, keepdim=False, eps=1e-8):
+    """Finite Euclidean norm with a well-defined JVP at zero."""
+
+    if eps <= 0:
+        raise ValueError('eps must be > 0')
+    return torch.sqrt(x.square().sum(dim=dim, keepdim=keepdim) + eps)
+
+
+def detached_primal(x):
+    """Return storage-backed primal coordinates inside a functorch JVP.
+
+    ``Tensor.detach()`` alone still returns a wrapper on PyTorch 2.0, which
+    ``torch_cluster`` cannot consume.  Unwrapping here keeps the topology
+    locally constant while leaving the original dual tensor untouched for all
+    differentiable distance/message-passing computations.
+    """
+
+    functorch = getattr(torch._C, '_functorch', None)
+    is_wrapped = getattr(functorch, 'is_functorch_wrapped_tensor', None)
+    if is_wrapped is not None and is_wrapped(x):
+        x = functorch.get_unwrapped(x)
+    return x.detach()
+
+
+def scatter_sum_jvp_compatible(src, index, dim=0, dim_size=None):
+    """A small native-PyTorch scatter sum that supports forward-mode AD."""
+
+    functorch = getattr(torch._C, '_functorch', None)
+    is_wrapped = getattr(functorch, 'is_functorch_wrapped_tensor', None)
+    if is_wrapped is None or not is_wrapped(src):
+        return torch_scatter_sum(src, index, dim=dim, dim_size=dim_size)
+    if dim != 0:
+        raise NotImplementedError('scatter_sum_jvp_compatible currently supports dim=0 only')
+    if dim_size is None:
+        dim_size = int(index.max().item()) + 1 if index.numel() else 0
+    out = src.new_zeros((dim_size,) + tuple(src.shape[1:]))
+    return out.index_add(0, index, src)
+
+
+def scatter_softmax_jvp_compatible(src, index, dim=0, dim_size=None):
+    """Segment softmax implemented with native ops for JVP compatibility."""
+
+    functorch = getattr(torch._C, '_functorch', None)
+    is_wrapped = getattr(functorch, 'is_functorch_wrapped_tensor', None)
+    if is_wrapped is None or not is_wrapped(src):
+        return torch_scatter_softmax(src, index, dim=dim, dim_size=dim_size)
+    if dim != 0:
+        raise NotImplementedError('scatter_softmax_jvp_compatible currently supports dim=0 only')
+    if dim_size is None:
+        dim_size = int(index.max().item()) + 1 if index.numel() else 0
+    if src.ndim == 1:
+        src = src.unsqueeze(-1)
+        squeeze = True
+    else:
+        squeeze = False
+
+    if dim_size == 0:
+        result = src.new_empty(src.shape)
+    else:
+        # The segment maximum is only a numerical-stability shift: softmax is
+        # invariant to it, so its derivative cancels exactly.  Computing that
+        # shift from the unwrapped primal avoids forward-AD support limitations
+        # in reduction kernels while keeping the differentiable exp/sum path
+        # fully vectorized.
+        primal = detached_primal(src)
+        max_values = primal.new_full(
+            (dim_size,) + tuple(primal.shape[1:]), -float('inf')
+        )
+        expanded_index = index.reshape(
+            (-1,) + (1,) * (primal.ndim - 1)
+        ).expand_as(primal)
+        max_values.scatter_reduce_(
+            0, expanded_index, primal, reduce='amax', include_self=True
+        )
+
+        exp_values = torch.exp(src - max_values[index])
+        denominator = scatter_sum_jvp_compatible(
+            exp_values, index, dim=0, dim_size=dim_size
+        )
+        result = exp_values / denominator[index].clamp_min(1e-12)
+    return result.squeeze(-1) if squeeze else result
 
 
 class BaseX2HAttLayer(nn.Module):
@@ -120,11 +204,15 @@ class BaseX2HAttLayer(nn.Module):
                     # (Wait, matches was already based on isin, so it should be fine)
                     attn_scores[matches] += bond_biases[bond_indices]
 
-        alpha = scatter_softmax(attn_scores, dst, dim=0, dim_size=N)  # [num_edges, n_heads]
+        alpha = scatter_softmax_jvp_compatible(
+            attn_scores, dst, dim=0, dim_size=N
+        )  # [num_edges, n_heads]
 
         # perform attention-weighted message-passing
         m = alpha.unsqueeze(-1) * v  # (E, heads, H_per_head)
-        output = scatter_sum(m, dst, dim=0, dim_size=N)  # (N, heads, H_per_head)
+        output = scatter_sum_jvp_compatible(
+            m, dst, dim=0, dim_size=N
+        )  # (N, heads, H_per_head)
         output = output.view(-1, self.output_dim)
         if self.out_fc:
             output = self.node_output(torch.cat([output, h], -1))
@@ -201,11 +289,15 @@ class BaseH2XAttLayer(nn.Module):
                 bond_indices = sorter[torch.searchsorted(bond_keys, relevant_edge_keys, sorter=sorter)]
                 attn_scores[matches] += bond_biases[bond_indices]
 
-        alpha = scatter_softmax(attn_scores, dst, dim=0, dim_size=N)  # (E, heads)
+        alpha = scatter_softmax_jvp_compatible(
+            attn_scores, dst, dim=0, dim_size=N
+        )  # (E, heads)
 
         # Perform attention-weighted message-passing
         m = alpha.unsqueeze(-1) * v  # (E, heads, 3)
-        output = scatter_sum(m, dst, dim=0, dim_size=N)  # (N, heads, 3)
+        output = scatter_sum_jvp_compatible(
+            m, dst, dim=0, dim_size=N
+        )  # (N, heads, 3)
         return output.mean(1)  # [num_nodes, 3]
 
 
@@ -259,7 +351,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             edge_feat = None
 
         rel_x = x[dst] - x[src]
-        dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
+        dist = safe_vector_norm(rel_x, dim=-1, keepdim=True)
 
         h_in = h
         # 4 separate distance embedding for p-p, p-l, l-p, l-l
@@ -280,7 +372,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             if not fix_x:
                 x = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
             rel_x = x[dst] - x[src]
-            dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
+            dist = safe_vector_norm(rel_x, dim=-1, keepdim=True)
 
         return x2h_out, x
 
@@ -293,7 +385,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             edge_feat = None
 
         rel_x = x[dst] - x[src]
-        dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
+        dist = safe_vector_norm(rel_x, dim=-1, keepdim=True)
 
         h_in = h
         # 4 separate distance embedding for p-p, p-l, l-p, l-l
@@ -339,7 +431,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             x = x.detach().requires_grad_(False)
             for _ in range(optimizer_steps):
                 rel_x_guide = x[dst] - x[src]
-                dist_guide = torch.norm(rel_x_guide, p=2, dim=-1, keepdim=True)
+                dist_guide = safe_vector_norm(rel_x_guide, dim=-1, keepdim=True)
                 for i in range(self.num_h2x):
                     dist_feat = self.distance_expansion(dist_guide)
                     dist_feat = outer_product(edge_attr, dist_feat)
@@ -348,7 +440,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                     if not fix_x:
                         x_guide = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
                     rel_x_guide = x_guide[dst] - x_guide[src]
-                    dist_guide = torch.norm(rel_x_guide, p=2, dim=-1, keepdim=True)
+                    dist_guide = safe_vector_norm(rel_x_guide, dim=-1, keepdim=True)
                     protein_pos = x[~mask_ligand]  # We are not updating protein x
                     ligand_pos = x_guide[mask_ligand]
                     batch_ligand = batch[mask_ligand]
@@ -384,7 +476,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 if not fix_x:
                     x = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
                 rel_x = x[dst] - x[src]
-                dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
+                dist = safe_vector_norm(rel_x, dim=-1, keepdim=True)
         return new_h, x
 
     def forward_guided_h_x(self, h, x, edge_attr, edge_index, mask_ligand, e_w=None, fix_x=False, batch=None, guide=None,
@@ -397,7 +489,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             edge_feat = None
 
         rel_x = x[dst] - x[src]
-        dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
+        dist = safe_vector_norm(rel_x, dim=-1, keepdim=True)
 
         h_in = h
         # 4 separate distance embedding for p-p, p-l, l-p, l-l
@@ -444,7 +536,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 x = x.detach().requires_grad_(True)
                 new_h = new_h.detach().requires_grad_(True)
                 rel_x_guide = x[dst] - x[src]
-                dist_guide = torch.norm(rel_x_guide, p=2, dim=-1, keepdim=True)
+                dist_guide = safe_vector_norm(rel_x_guide, dim=-1, keepdim=True)
                 for i in range(self.num_h2x):
                     dist_feat = self.distance_expansion(dist_guide)
                     dist_feat = outer_product(edge_attr, dist_feat)
@@ -453,7 +545,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                     if not fix_x:
                         x_guide = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
                     rel_x_guide = x_guide[dst] - x_guide[src]
-                    dist_guide = torch.norm(rel_x_guide, p=2, dim=-1, keepdim=True)
+                    dist_guide = safe_vector_norm(rel_x_guide, dim=-1, keepdim=True)
                     protein_pos = x[~mask_ligand]  # We are not updating protein x
                     ligand_pos = x_guide[mask_ligand]
                     batch_ligand = batch[mask_ligand]
@@ -483,7 +575,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                         optimizer.step()
                         optimizer.zero_grad()
             rel_x = x[dst] - x[src]
-            dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
+            dist = safe_vector_norm(rel_x, dim=-1, keepdim=True)
 
             for i in range(self.num_h2x):
                 dist_feat = self.distance_expansion(dist)
@@ -493,7 +585,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 if not fix_x:
                     x = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
                 rel_x = x[dst] - x[src]
-                dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
+                dist = safe_vector_norm(rel_x, dim=-1, keepdim=True)
         return x2h_out, x
 
 class UniTransformerO2TwoUpdateGeneral(nn.Module):
@@ -565,12 +657,17 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
 
     def _connect_edge(self, x, mask_ligand, batch):
         if self.cutoff_mode == 'radius':
-            edge_index = radius_graph(x, r=self.r, batch=batch, flow='source_to_target')
+            edge_index = radius_graph(
+                detached_primal(x), r=self.r, batch=batch, flow='source_to_target'
+            )
         elif self.cutoff_mode == 'knn':
-            edge_index = knn_graph(x, k=self.k, batch=batch, flow='source_to_target')
+            edge_index = knn_graph(
+                detached_primal(x), k=self.k, batch=batch, flow='source_to_target'
+            )
         elif self.cutoff_mode == 'hybrid':
             edge_index = batch_hybrid_edge_connection(
-                x, k=self.k, mask_ligand=mask_ligand, batch=batch, add_p_index=True)
+                detached_primal(x), k=self.k, mask_ligand=mask_ligand, batch=batch, add_p_index=True
+            )
         else:
             raise ValueError(f'Not supported cutoff mode: {self.cutoff_mode}')
         return edge_index
@@ -589,22 +686,34 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
         return edge_type
 
     def forward(self, h, x, mask_ligand, batch, return_all=False, fix_x=False,
-                bond_edge_index=None, bond_edge_feat=None):
+                bond_edge_index=None, bond_edge_feat=None, edge_indices=None,
+                return_edge_indices=False):
         ## coordinate x is predicted at every layer and the category v is predicted only at the end of all layers
 
         all_x = [x]
         all_h = [h]
+        used_edge_indices = []
+
+        if edge_indices is not None and len(edge_indices) != self.num_blocks:
+            raise ValueError(
+                f'Expected {self.num_blocks} fixed edge-index tensors, got {len(edge_indices)}'
+            )
 
         for b_idx in range(self.num_blocks):
             ## consider edge based on "radius" threshold or "knn" neighbours
-            edge_index = self._connect_edge(x, mask_ligand, batch)
+            if edge_indices is None:
+                edge_index = self._connect_edge(x, mask_ligand, batch)
+            else:
+                edge_index = edge_indices[b_idx]
+            if return_edge_indices:
+                used_edge_indices.append(edge_index)
             src, dst = edge_index
 
             ## building the edge features
             # edge type (dim: 4)
             edge_type = self._build_edge_type(edge_index, mask_ligand)
             if self.ew_net_type == 'global':
-                dist = torch.norm(x[dst] - x[src], p=2, dim=-1, keepdim=True)
+                dist = safe_vector_norm(x[dst] - x[src], dim=-1, keepdim=True)
                 ## gaussian smearing to compute the embedding of any distance as such
                 dist_feat = self.distance_expansion(dist)
                 logits = self.edge_pred_layer(dist_feat)
@@ -621,6 +730,8 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
         outputs = {'x': x, 'h': h}
         if return_all:
             outputs.update({'all_x': all_x, 'all_h': all_h})
+        if return_edge_indices:
+            outputs['edge_indices'] = used_edge_indices
         return outputs
 
     def forward_guided(self, h, x, mask_ligand, batch, return_all=False, fix_x=False, guide=None,
@@ -635,7 +746,7 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
             # edge type (dim: 4)
             edge_type = self._build_edge_type(edge_index, mask_ligand)
             if self.ew_net_type == 'global':
-                dist = torch.norm(x[dst] - x[src], p=2, dim=-1, keepdim=True)
+                dist = safe_vector_norm(x[dst] - x[src], dim=-1, keepdim=True)
                 dist_feat = self.distance_expansion(dist)
                 logits = self.edge_pred_layer(dist_feat)
                 e_w = torch.sigmoid(logits)
