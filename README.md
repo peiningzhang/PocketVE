@@ -84,13 +84,25 @@ This reports Vina scores, QED, SA, and diversity. Use `--docking_mode none` to s
 
 ## Results
 
-Selected CrossDocked2020 results from [Table 1 of the paper](https://arxiv.org/html/2609.08101v3#S4).
+The main CrossDocked2020 benchmark samples 100 ligands per pocket across 100 test pockets. The tables show all main-benchmark metrics for PocketVE at CFG scale 5, alongside TargetDiff and guided TAGMol. [Paper, Table 1](https://arxiv.org/html/2609.08101v3#S4).
 
-| Method | Vina Score median ↓ | Vina Dock median ↓ | Valid₃ᴅ (%) ↑ | Strain ↓ | Clash-free (%) ↑ |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| TargetDiff | −6.30 | −7.91 | 78.4 | 306.0 | 86.41 |
-| TAGMol (guided) | −7.77 | −8.69 | 58.6 | 457.4 | 93.21 |
-| **PocketVE (CFG scale 5)** | **−7.89** | **−8.89** | **80.6** | **127.9** | **94.02** |
+### Docking and molecular properties
+
+Vina columns show mean / median. QED, SA, and diversity are medians. High Affinity measures how often the generated ligand matches or improves on the reference ligand's Vina Dock score. Joint-Ref applies that criterion jointly to Vina Dock, QED, and SA.
+
+| Method | Vina Score ↓ | Vina Min ↓ | Vina Dock ↓ | High Affinity (%) ↑ | Joint-Ref (%) ↑ | QED ↑ | SA ↑ | Diversity ↑ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TargetDiff | −5.47 / −6.30 | −6.64 / −6.83 | −7.80 / −7.91 | 57.6 | 5.7 | 0.48 | 0.58 | 0.71 |
+| TAGMol (guided) | −7.02 / −7.77 | −7.95 / −8.07 | −8.59 / −8.69 | 68.6 | 7.1 | 0.56 | 0.56 | 0.70 |
+| **PocketVE (CFG scale 5)** | −7.44 / −7.89 | −7.93 / −8.19 | −8.72 / −8.89 | 73.9 | 26.4 | 0.64 | 0.71 | 0.71 |
+
+### 3D geometry
+
+| Method | Valid₃ᴅ (%) ↑ | Strain ↓ | Clash-free (%) ↑ | Centroid distance (Å) ↓ |
+| --- | ---: | ---: | ---: | ---: |
+| TargetDiff | 78.4 | 306.0 | 86.41 | 1.49 |
+| TAGMol (guided) | 58.6 | 457.4 | 93.21 | 1.54 |
+| **PocketVE (CFG scale 5)** | 80.6 | 127.9 | 94.02 | 1.26 |
 
 ## Citation
 
