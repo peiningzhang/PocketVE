@@ -17,12 +17,31 @@ from torch_geometric.transforms import Compose
 import utils.misc as misc
 import utils.transforms as trans
 from datasets import get_dataset
+from datasets.pl_data import ProteinLigandData, torchify_dict
 from models.molopt_score_model import ScorePosNet3D
 from models.molopt_guide_model import DockGuideNet3D
 from scripts.sample_diffusion import sample_diffusion_ligand
 # Multi‑guide diffusion function
 from scripts.sample_multi_guided_diffusion import sample_guided_diffusion_ligand as sample_multi_guided_diffusion
 from scripts.evaluate_diffusion import report_evaluation_to_logger, run_evaluation
+from utils.data import PDBProtein
+
+
+def load_pocket_pdb(path, featurizer):
+    protein = torchify_dict(PDBProtein(path, mode='path').to_dict_atom())
+    if not len(protein['element']):
+        raise ValueError(f'No protein atoms found in {path}')
+    data = ProteinLigandData.from_protein_ligand_dicts(
+        protein_dict=protein,
+        ligand_dict={
+            'element': torch.empty(0, dtype=torch.long),
+            'bond_index': torch.empty((2, 0), dtype=torch.long),
+            'bond_type': torch.empty(0, dtype=torch.long),
+        },
+        protein_filename=os.path.basename(path),
+        ligand_filename=os.path.splitext(os.path.basename(path))[0] + '.sdf',
+    )
+    return featurizer(data)
 
 
 def export_metrics_to_grouped_sdf(pt_file, out_dir, logger):
@@ -218,6 +237,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file (typically training.yml).')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to trained checkpoint (.pt).')
+    parser.add_argument('--pocket_pdb', help='Sample from one cropped protein-pocket PDB instead of the test split.')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use for sampling.')
     parser.add_argument('--num_proteins', type=int, default=5, help='Number of protein pockets to evaluate (from test split).')
     parser.add_argument(
@@ -362,6 +382,8 @@ def main():
         parser.error('--sample_only cannot be used with --export_grouped_sdf or --run_genbench (evaluation is skipped).')
     if args.sigma_pocket < 0.0:
         parser.error('--sigma_pocket must be non-negative')
+    if args.pocket_pdb and (args.docking_mode != 'none' or args.run_genbench):
+        parser.error('--pocket_pdb supports sampling and SDF export without benchmark docking or GenBench3D.')
 
     # Load global config (data split, seeds, etc.)
     config = misc.load_config(args.config)
@@ -404,11 +426,14 @@ def main():
     ligand_featurizer = trans.FeaturizeLigandAtom(ligand_atom_mode)
     transform = Compose([protein_featurizer, ligand_featurizer, trans.FeaturizeLigandBond()])
 
-    # Load dataset (test split) using the transforms above
-    logger.info("Loading dataset (test split)...")
-    dataset, subsets = get_dataset(config=config.data, transform=transform)
-    test_set = subsets["test"]
-    logger.info(f"Test set size: {len(test_set)}")
+    if args.pocket_pdb:
+        test_set = [load_pocket_pdb(args.pocket_pdb, protein_featurizer)]
+        logger.info("Sampling from pocket PDB: %s", args.pocket_pdb)
+    else:
+        logger.info("Loading dataset (test split)...")
+        _, subsets = get_dataset(config=config.data, transform=transform)
+        test_set = subsets["test"]
+        logger.info(f"Test set size: {len(test_set)}")
 
     if args.start_protein_idx < 0:
         parser.error('--start_protein_idx must be >= 0')

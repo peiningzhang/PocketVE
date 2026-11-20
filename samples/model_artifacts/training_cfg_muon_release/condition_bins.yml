@@ -1,0 +1,60 @@
+num_bins: 5
+properties:
+  vina:
+    field: vina_dock
+    direction: lower_is_better
+    edges:
+    - 6.341836
+    - 7.815296
+    - 8.817652
+    - 10.049274000000002
+    train_count: 99990
+    train_min: -999.0
+    train_max: 17.20263
+    train_mean: 8.194917587658766
+    test_count: 100
+    test_min: -3.39332
+    test_max: 15.64895
+    test_mean: 7.1477889
+  qed:
+    field: qed
+    direction: higher_is_better
+    edges:
+    - 0.33519251926610755
+    - 0.4733602875905874
+    - 0.5979214123745736
+    - 0.7384734406585055
+    train_count: 99990
+    train_min: 0.015367094880010262
+    train_max: 0.9475419565700227
+    train_mean: 0.5335494323601402
+    test_count: 100
+    test_min: 0.06079412121454693
+    test_max: 0.9034566339582102
+    test_mean: 0.47599607386819964
+  sa:
+    field: sa
+    direction: higher_is_better
+    edges:
+    - 0.66
+    - 0.73
+    - 0.79
+    - 0.86
+    train_count: 99990
+    train_min: 0.18
+    train_max: 1.0
+    train_mean: 0.7546104610461046
+    test_count: 100
+    test_min: 0.25
+    test_max: 0.93
+    test_mean: 0.7275
+scan:
+  vina:
+    train_field: vina_dock
+    test_field: vina_dock
+  qed:
+    train_field: qed
+    test_field: qed
+  sa:
+    train_field: sa
+    test_field: sa
