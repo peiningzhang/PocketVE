@@ -46,6 +46,14 @@ python code/scripts/quick_evaluate.py \
 
 The run writes sampling results under `tmp_eval/quick_eval_*/` and reconstructed molecules under its `sdfs_grouped/` subdirectory. See the [included sample outputs](samples/quick_evaluate_release/sdfs_grouped) for examples. To sample from the CrossDocked2020 test split, follow [Data setup](REPRODUCIBILITY.md#data-setup) and omit `--pocket_pdb`.
 
+## Evaluation
+
+- [`quick_evaluate.py`](code/scripts/quick_evaluate.py) runs sampling, evaluation, and grouped SDF export. See the [main benchmark command](REPRODUCIBILITY.md#main-benchmark) for the paper setting.
+- [`evaluate_diffusion.py`](code/scripts/evaluate_diffusion.py) evaluates existing sampling outputs for Vina scores, QED, SA, and diversity.
+- [`run_genbench_eval.py`](scripts/run_genbench_eval.py) evaluates grouped SDFs with a separate GenBench3D installation. See the [GenBench3D setup and command](REPRODUCIBILITY.md#genbench3d-geometry-metrics).
+
+The paper describes the PoseCheck and pocket-permutation protocols in [Appendix N](https://arxiv.org/html/2609.08101v3#A14).
+
 ## Citation
 
 ```bibtex
