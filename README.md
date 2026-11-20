@@ -20,7 +20,7 @@ export PYTHONPATH="$PWD/code${PYTHONPATH:+:$PYTHONPATH}"
 
 ## Data and Checkpoints
 
-Training and benchmark evaluation use the processed CrossDocked2020 10 Å pockets and the matching train/test split. Docking and GenBench3D evaluation also use the test-set receptors and reference ligands. See [data setup](REPRODUCIBILITY.md#data-setup) for the required files and paths.
+The [benchmark data setup](REPRODUCIBILITY.md#data-setup) links to the public CrossDocked2020 pocket10 LMDB, matching split, and reference structures. The [training data requirements](REPRODUCIBILITY.md#training) list the separately prepared data with property labels.
 
 [`last.pt`](samples/model_artifacts/training_cfg_muon_release/checkpoints/last.pt) is the model checkpoint used for the main paper results. Use it with the accompanying [sampling configuration](samples/model_artifacts/training_cfg_muon_release/sampling.yml).
 
@@ -70,7 +70,7 @@ The run writes sampling results under `tmp_eval/quick_eval_*/` and reconstructed
 
 ### Sample the CrossDocked2020 test set
 
-After [data setup](REPRODUCIBILITY.md#data-setup), omit `--pocket_pdb` to sample from the test split. Use `--start_protein_idx` and `--num_proteins` to select a range of pockets.
+After [data setup](REPRODUCIBILITY.md#data-setup), pass `--config data/sampling_benchmark.yml` and omit `--pocket_pdb` to sample from the test split. Use `--start_protein_idx` and `--num_proteins` to select a range of pockets.
 
 ## Evaluation
 

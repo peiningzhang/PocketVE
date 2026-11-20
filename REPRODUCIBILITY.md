@@ -4,18 +4,42 @@ Use the environment and `PYTHONPATH` from the [environment setup](README.md#envi
 
 ## Data setup
 
-The released configurations expect the 10 Å pocket version of CrossDocked2020 and a split whose indices match the property-annotated LMDB. The [CrossDocked2020 documentation](https://github.com/gnina/models/tree/master/data/CrossDocked2020) and [TAGMol data instructions](https://github.com/MoleculeAI/TAGMol#data-and-checkpoints) describe the upstream resources.
+For sampling and evaluation with `last.pt`, download the standard CrossDocked2020 pocket10 LMDB, its paired split, and the test reference structures from the [LandFlow data mirror](https://huggingface.co/datasets/NYCU-MLLab/Physics-Inspired-Landscape-Learning-and-Flow-Matching-data/tree/8394343d0a38690d83d7dfb850790d1896763c2c/data). The 100 test entries match PocketVE's original benchmark in order and model inputs. The receptor PDBs and reference ligand SDFs also match byte for byte.
 
-| Path | Purpose |
-| --- | --- |
-| `data/crossdocked_v1.1_rmsd1.0_pocket10_processed_dock_guide_final.lmdb` | Preprocessed receptor-pocket and ligand pairs with property annotations. The loader derives this filename from `data.path` in the YAML. |
-| `data/crossdocked_pocket10_pose_split_dock_guide.pt` | Matching train/test index split. Its test split contains the 100 benchmark pockets. |
-| `data/crossdocked_v1.1_rmsd1.0_pocket10/index.pkl` | Annotated index used when building the LMDB from raw pocket files. An existing processed LMDB is sufficient for sampling. |
-| `data/test_set/` | Per-pocket reference ligands and receptor PDBs used for docking and GenBench3D. |
+```bash
+mkdir -p data
+(
+  set -e
+  cd data
+  source_url=https://huggingface.co/datasets/NYCU-MLLab/Physics-Inspired-Landscape-Learning-and-Flow-Matching-data/resolve/8394343d0a38690d83d7dfb850790d1896763c2c/data
+  curl -fLO "$source_url/crossdocked_v1.1_rmsd1.0_pocket10_processed_final.lmdb"
+  curl -fLO "$source_url/crossdocked_pocket10_pose_split.pt"
+  curl -fLO "$source_url/test_set.tar.gz"
+  sha256sum -c <<'EOF'
+90e3399529420f2ecb74bc47744f10291e27fc20a325545180d7f9ba52fec68f  crossdocked_v1.1_rmsd1.0_pocket10_processed_final.lmdb
+fc2e32512985e1f01f70b95ca58c0f5abf1ab0a6a7985cabcfedd969ac730bc4  crossdocked_pocket10_pose_split.pt
+c93289d4b1522f168872d53cd927bf3982e721a93cd5978bdb574a845ae3d71b  test_set.tar.gz
+EOF
+  tar -xzf test_set.tar.gz --wildcards 'test_set/*/*_rec.pdb' 'test_set/*/*.sdf'
+)
+```
 
-The repository includes the checkpoint, condition-bin specification, and selected generated samples. Obtain the matching LMDB and split separately. A split from a differently ordered LMDB can silently select different pockets. To use another layout, update `data.path`, `data.split`, and `data.test_path` in the config you pass on the command line.
+Generate a sampling config that selects the standard LMDB loader and its matching split. The rest of the released sampling configuration is carried forward.
 
-The reference split has SHA-256 `124077745a21d9bc95a69c1dce50856d70508213f3575bb17d10e3a36af3fae8`.
+```bash
+python - <<'PY'
+from pathlib import Path
+import yaml
+
+source = Path("samples/model_artifacts/training_cfg_muon_release/sampling.yml")
+config = yaml.safe_load(source.read_text())
+config["data"]["name"] = "pl"
+config["data"]["split"] = "data/crossdocked_pocket10_pose_split.pt"
+Path("data/sampling_benchmark.yml").write_text(yaml.safe_dump(config, sort_keys=False))
+PY
+```
+
+Keep the LMDB and split paired because the split indices follow the LMDB's key order. See the [CrossDocked2020 data license](https://bits.csb.pitt.edu/files/crossdock2020/LICENSE).
 
 ## Main benchmark
 
@@ -25,7 +49,7 @@ The main paper setting uses the released checkpoint, 100 test pockets, 100 sampl
 model_dir=samples/model_artifacts/training_cfg_muon_release
 
 python code/scripts/quick_evaluate.py \
-  --config "$model_dir/sampling.yml" \
+  --config data/sampling_benchmark.yml \
   --checkpoint "$model_dir/checkpoints/last.pt" \
   --num_proteins 100 \
   --num_ligands_per_protein 100 \
@@ -58,7 +82,12 @@ GenBench3D writes per-pocket JSON and an aggregate file under `sdfs_grouped/genb
 
 ## Training
 
-The [Muon training config](code/configs/training_cfg_muon.yml) uses the property-annotated training split. Its condition-bin path points to the published [bin specification](samples/model_artifacts/training_cfg_muon_release/condition_bins.yml). To use a different training split, generate a matching specification with `code/scripts/data_preparation/build_condition_bins.py` and update `data.transform.condition_bins_path`.
+Training from scratch requires Vina, QED, and SA labels. The [Muon training config](code/configs/training_cfg_muon.yml) expects the following paired files under `data/`:
+
+- `crossdocked_v1.1_rmsd1.0_pocket10_processed_dock_guide_final.lmdb`
+- `crossdocked_pocket10_pose_split_dock_guide.pt`
+
+The public benchmark download above supports sampling and evaluation with the pretrained checkpoint. The property-annotated training LMDB and its split are separate assets and do not currently have a public download link. The training config points to the included [bin specification](samples/model_artifacts/training_cfg_muon_release/condition_bins.yml). To use a different training split, generate a matching specification with `code/scripts/data_preparation/build_condition_bins.py` and update `data.transform.condition_bins_path`.
 
 ```bash
 python code/scripts/train_diffusion.py code/configs/training_cfg_muon.yml --no_wandb
