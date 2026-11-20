@@ -1,6 +1,6 @@
 # Reproducing PocketVE
 
-Use the environment and `PYTHONPATH` from the [installation instructions](README.md#installation). Run the commands from the repository root.
+Use the environment and `PYTHONPATH` from the [environment setup](README.md#environment-setup). Run the commands from the repository root.
 
 ## Data setup
 
