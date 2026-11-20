@@ -38,6 +38,14 @@ Logs and checkpoints are saved under `logs_diffusion/` by default. See the [trai
 
 ## Sampling
 
+### `quick_evaluate.py`
+
+[`quick_evaluate.py`](code/scripts/quick_evaluate.py) samples ligands and evaluates the generated molecules by default. Each sampled pocket has a `result_*.pt` file under `tmp_eval/quick_eval_*/`.
+
+- Use `--sample_only` to write the sampling outputs and stop before evaluation. Pass the output directory to [the standalone evaluator](#evaluate-existing-sampling-outputs) later.
+- Use `--export_grouped_sdf` to run evaluation and write one SDF per pocket under `sdfs_grouped/`. Use `--docking_mode none` to skip docking.
+- For `--pocket_pdb` input, use the sampling or SDF export workflow. Benchmark docking and GenBench3D use the CrossDocked2020 reference structures.
+
 ### Sample one pocket
 
 From the repository root, set `--pocket_pdb` to a PDB cropped to the binding pocket. This example samples ten ligands and exports the reconstructed molecules without requiring a benchmark dataset. Use `--device cpu` for a CPU run.
@@ -62,13 +70,17 @@ The run writes sampling results under `tmp_eval/quick_eval_*/` and reconstructed
 
 ### Sample the CrossDocked2020 test set
 
-After [data setup](REPRODUCIBILITY.md#data-setup), omit `--pocket_pdb` to sample from the test split. Use `--start_protein_idx` and `--num_proteins` to select a range of pockets. The [main benchmark command](REPRODUCIBILITY.md#main-benchmark) uses 100 pockets, 100 ligands per pocket, and CFG scale 5.
+After [data setup](REPRODUCIBILITY.md#data-setup), omit `--pocket_pdb` to sample from the test split. Use `--start_protein_idx` and `--num_proteins` to select a range of pockets.
 
 ## Evaluation
 
-### Evaluate generated molecules
+### Run the main benchmark
 
-[`quick_evaluate.py`](code/scripts/quick_evaluate.py) runs sampling, evaluation, and grouped SDF export in one command. To evaluate an existing directory of `result_*.pt` files, use [`evaluate_diffusion.py`](code/scripts/evaluate_diffusion.py).
+The [main benchmark command](REPRODUCIBILITY.md#main-benchmark) uses `quick_evaluate.py` to sample 100 ligands per pocket across all 100 test pockets at CFG scale 5, run Vina docking, and export grouped SDFs.
+
+### Evaluate existing sampling outputs
+
+Use [`evaluate_diffusion.py`](code/scripts/evaluate_diffusion.py) to evaluate a directory of `result_*.pt` files.
 
 ```bash
 python code/scripts/evaluate_diffusion.py /path/to/sampling_results \
