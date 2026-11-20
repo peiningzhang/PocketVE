@@ -82,8 +82,6 @@ This reports Vina scores, QED, SA, and diversity. Use `--docking_mode none` to s
 
 [`run_genbench_eval.py`](scripts/run_genbench_eval.py) evaluates grouped SDFs with a separate GenBench3D installation. See the [GenBench3D setup and command](REPRODUCIBILITY.md#genbench3d-geometry-metrics).
 
-The paper describes the PoseCheck and pocket-permutation protocols in [Appendix N](https://arxiv.org/html/2609.08101v3#A14).
-
 ## Results
 
 Selected CrossDocked2020 results from [Table 1 of the paper](https://arxiv.org/html/2609.08101v3#S4).
